@@ -18,7 +18,7 @@ This project does not use AI, RAG, or a database.
 - List uploaded documents
 - Simple chat endpoint
 - Pydantic request and response validation
-- Swagger UI documentation
+- Swagger UI documentation.
 
 ## Tech Stack
 
