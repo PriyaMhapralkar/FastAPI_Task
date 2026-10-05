@@ -1,0 +1,16 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment files
+.env
+
+# VS Code settings
+.vscode/
+
+# Uploaded files (keep the folder, ignore the content)
+uploads/*
+!uploads/.gitkeep
