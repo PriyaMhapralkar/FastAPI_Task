@@ -1,11 +1,6 @@
 from pydantic import BaseModel, ConfigDict, Field
 
-class DocumentRecord(BaseModel):
-    """Metadata stored in memory for each uploaded document."""
 
-    file_id: str
-    file_name: str
-    file_type: str
 
 class UploadResponse(BaseModel):
     file_id: str
