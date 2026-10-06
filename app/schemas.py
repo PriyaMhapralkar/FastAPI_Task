@@ -8,6 +8,7 @@ class UploadResponse(BaseModel):
     file_name: str
     file_type: str
     file_size: int
+    total_chunks: int
     status: str
 
 
@@ -18,7 +19,7 @@ class DocumentItem(BaseModel):
     file_name: str
     file_type: str
     file_size: int
-    uploaded_by: int | None
+    uploaded_by: str | None
     uploaded_at: datetime
 
 
@@ -47,3 +48,15 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
+
+
+class ChunkItem(BaseModel):
+    chunk_id: int  
+    text: str
+
+
+class ProcessResponse(BaseModel):
+    document_id: int
+    file_name: str
+    total_chunks: int
+    chunks: list[ChunkItem]

@@ -3,19 +3,30 @@ import logging
 import uuid
 from pathlib import Path
 from typing import Annotated
+from sqlalchemy import delete, select
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
-from sqlalchemy import select
+
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+
+from app.models import ChatHistory, DocumentChunk, Document
+from app.processing import (
+    ProcessingError,
+    chunk_text,
+    clean_text,
+    extract_text,
+)
+
 from app.database import get_db
-from app.models import ChatHistory, Document
 from app.schemas import (
     ChatRequest,
     ChatResponse,
+    ChunkItem,
     DocumentItem,
     DocumentListResponse,
+    ProcessResponse,
     UploadResponse,
 )
 
@@ -85,6 +96,55 @@ def save_file(extension: str, contents: bytes) -> Path:
     return saved_path
 
 
+def process_document(
+    db: Session,
+    document: Document
+) -> list[DocumentChunk]:
+    """Extract, clean, chunk, and save a document's text."""
+
+    path = BASE_DIR / document.file_path
+
+    if not path.is_file():
+        raise ProcessingError(
+            "The file is missing from the uploads folder."
+        )
+
+    extension = f".{document.file_type}"
+
+    text = clean_text(
+        extract_text(path, extension)
+    )
+
+    pieces = chunk_text(text)
+
+    if not pieces:
+        raise ProcessingError(
+            "No readable text found. "
+            "The file may be empty or a scanned image."
+        )
+
+    db.execute(
+        delete(DocumentChunk).where(
+            DocumentChunk.document_id == document.id
+        )
+    )
+
+    rows = [
+        DocumentChunk(
+            document_id=document.id,
+            chunk_index=i,
+            chunk_text=piece,
+            char_count=len(piece),
+        )
+        for i, piece in enumerate(pieces, start=1)
+    ]
+
+    db.add_all(rows)
+    db.commit()
+
+    return rows
+
+
 @app.get("/", tags=["Health"])
 def root() -> dict[str, str]:
     return {"message": "Document & Chat API is running"}
@@ -99,12 +159,12 @@ def root() -> dict[str, str]:
 def upload_document(
     db: DbSession,
     file: UploadFile | None = File(default=None),
-    uploaded_by: int | None = Form(
-        default=None, gt=0, description="Optional ID of the user uploading the file."
+    uploaded_by: str | None = Form(
+        default=None, description="Optional name or ID of the user uploading the file."
     ),
 ) -> UploadResponse:
+    uploaded_by = (uploaded_by or "").strip() or None  
     original_name, extension = get_validated_name_and_extension(file)
-
     contents = file.file.read()
     if not contents:
         raise bad_request("The uploaded file is empty.")
@@ -127,25 +187,40 @@ def upload_document(
     try:
         db.commit()
     except IntegrityError:
-        # Two identical uploads raced; the UNIQUE constraint caught the second one
         db.rollback()
         saved_path.unlink(missing_ok=True)
         raise duplicate_error()
     except SQLAlchemyError as exc:
         db.rollback()
-        saved_path.unlink(missing_ok=True)  # do not leave an orphan file behind
+        saved_path.unlink(missing_ok=True)  
         logger.exception("Database error while saving document")
         raise database_error("Could not store the document information. Please try again.") from exc
 
-    db.refresh(document)  # loads the database-generated id and uploaded_at
+    db.refresh(document) 
+
+    try:
+        total_chunks = len(
+            process_document(db, document)
+        )
+    except (ProcessingError, SQLAlchemyError) as exc:
+        db.rollback()
+
+        logger.warning(
+            "Document %s uploaded but not chunked: %s",
+            document.id,
+            exc,
+        )
+
+        total_chunks = 0
 
     return UploadResponse(
-        id=document.id,
-        file_name=document.file_name,
-        file_type=document.file_type,
-        file_size=document.file_size,
-        status="Uploaded successfully",
-    )
+    id=document.id,
+    file_name=document.file_name,
+    file_type=document.file_type,
+    file_size=document.file_size,
+    total_chunks=total_chunks,
+    status="Uploaded successfully",
+)
 
 
 @app.get("/documents", response_model=DocumentListResponse, tags=["Documents"])
@@ -158,6 +233,58 @@ def list_documents(db: DbSession) -> DocumentListResponse:
 
     return DocumentListResponse(
         documents=[DocumentItem.model_validate(row) for row in rows]
+    )
+
+@app.post(
+    "/documents/{document_id}/process",
+    response_model=ProcessResponse,
+    tags=["Documents"],
+)
+def process_document_endpoint(
+    document_id: int,
+    db: DbSession
+) -> ProcessResponse:
+
+    document = db.get(Document, document_id)
+
+    if document is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found."
+        )
+
+    try:
+        rows = process_document(db, document)
+
+    except ProcessingError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc)
+        ) from exc
+
+    except SQLAlchemyError as exc:
+        db.rollback()
+
+        logger.exception(
+            "Database error while processing document %s",
+            document_id
+        )
+
+        raise database_error(
+            "Could not store the chunks. Please try again."
+        ) from exc
+
+    return ProcessResponse(
+        document_id=document.id,
+        file_name=document.file_name,
+        total_chunks=len(rows),
+        chunks=[
+            ChunkItem(
+                chunk_id=row.chunk_index,
+                text=row.chunk_text
+            )
+            for row in rows
+        ],
     )
 
 
