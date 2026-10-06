@@ -1,4 +1,5 @@
 import uuid
+import hashlib
 import logging
 from pathlib import Path
 
@@ -31,6 +32,7 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".doc", ".docx"}
 
 documents: list[DocumentRecord] = []
+file_hashes: dict[str, str] = {} 
 
 def bad_request(detail: str) -> HTTPException:
     return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
@@ -68,6 +70,11 @@ def save_file(file_id: str, extension: str, contents: bytes) -> None:
         ) from exc
 
 
+def compute_hash(contents: bytes) -> str:
+    """Return the SHA-256 fingerprint of the file content."""
+    return hashlib.sha256(contents).hexdigest()    
+
+
 
 @app.get("/", tags=["Health"])
 def root() -> dict[str, str]:
@@ -85,9 +92,17 @@ async def upload_document(
     if not contents:
         raise bad_request("The uploaded file is empty.")
 
+    content_hash = compute_hash(contents)
+    if content_hash in file_hashes:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Duplicate file. This document has already been uploaded.",
+        )
+
     file_id = str(uuid.uuid4())
     save_file(file_id, extension, contents)
 
+    file_hashes[content_hash] = file_id
     record = DocumentRecord(
         file_id=file_id,
         file_name=original_name,
