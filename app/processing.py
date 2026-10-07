@@ -11,8 +11,8 @@ from pypdf import PdfReader
 
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 50
 
 
 class ProcessingError(Exception):

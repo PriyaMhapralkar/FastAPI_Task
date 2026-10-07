@@ -2,6 +2,7 @@ from datetime import datetime
 
 from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import JSONB
 
 from app.database import Base
 
@@ -33,7 +34,7 @@ class Document(Base):
 
     uploaded_by: Mapped[str | None] = mapped_column(
         String(255)
-    )
+    ) 
 
     uploaded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -85,6 +86,8 @@ class DocumentChunk(Base):
     chunk_text: Mapped[str] = mapped_column(Text)
 
     char_count: Mapped[int] = mapped_column(Integer)
+
+    embedding: Mapped[list[float] | None] = mapped_column(JSONB)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

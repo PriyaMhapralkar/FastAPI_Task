@@ -20,7 +20,10 @@ engine = create_engine(
 
 SessionLocal = sessionmaker(
     bind=engine,
-    autoflush=False
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False
+
 )
 
 

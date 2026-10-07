@@ -59,4 +59,17 @@ class ProcessResponse(BaseModel):
     document_id: int
     file_name: str
     total_chunks: int
+    embedding_model: str
+    embedding_dimension: int
     chunks: list[ChunkItem]
+
+
+class EmbeddingItem(BaseModel):
+    chunk_id: int
+    embedding_dimension: int    
+
+class EmbeddingListResponse(BaseModel):
+    document_id: int
+    embedding_model: str
+    embedding_dimension: int
+    embeddings: list[EmbeddingItem]    

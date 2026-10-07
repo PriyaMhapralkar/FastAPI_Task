@@ -18,6 +18,12 @@ from app.processing import (
     clean_text,
     extract_text,
 )
+from app.embeddings import (
+    EMBEDDING_DIM,
+    MODEL_NAME,
+    EmbeddingError,
+    embed_texts,
+)
 
 from app.database import get_db
 from app.schemas import (
@@ -28,6 +34,8 @@ from app.schemas import (
     DocumentListResponse,
     ProcessResponse,
     UploadResponse,
+    EmbeddingItem,
+    EmbeddingListResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -123,6 +131,11 @@ def process_document(
             "The file may be empty or a scanned image."
         )
 
+    try:
+        embeddings = embed_texts(pieces)
+    except EmbeddingError:
+        raise
+
     db.execute(
         delete(DocumentChunk).where(
             DocumentChunk.document_id == document.id
@@ -130,15 +143,18 @@ def process_document(
     )
 
     rows = [
-        DocumentChunk(
-            document_id=document.id,
-            chunk_index=i,
-            chunk_text=piece,
-            char_count=len(piece),
-        )
-        for i, piece in enumerate(pieces, start=1)
-    ]
-
+    DocumentChunk(
+        document_id=document.id,
+        chunk_index=i,
+        chunk_text=piece,
+        char_count=len(piece),
+        embedding=embedding,
+    )
+    for i, (piece, embedding) in enumerate(
+        zip(pieces, embeddings),
+        start=1,
+    )
+]
     db.add_all(rows)
     db.commit()
 
@@ -202,7 +218,7 @@ def upload_document(
         total_chunks = len(
             process_document(db, document)
         )
-    except (ProcessingError, SQLAlchemyError) as exc:
+    except (ProcessingError, EmbeddingError, SQLAlchemyError) as exc:
         db.rollback()
 
         logger.warning(
@@ -262,6 +278,14 @@ def process_document_endpoint(
             detail=str(exc)
         ) from exc
 
+    except EmbeddingError as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc)
+        ) from exc
+
     except SQLAlchemyError as exc:
         db.rollback()
 
@@ -274,10 +298,16 @@ def process_document_endpoint(
             "Could not store the chunks. Please try again."
         ) from exc
 
+        
+
+       
+
     return ProcessResponse(
         document_id=document.id,
         file_name=document.file_name,
         total_chunks=len(rows),
+        embedding_model=MODEL_NAME,
+        embedding_dimension=EMBEDDING_DIM,
         chunks=[
             ChunkItem(
                 chunk_id=row.chunk_index,
@@ -286,6 +316,45 @@ def process_document_endpoint(
             for row in rows
         ],
     )
+
+
+@app.get(
+    "/documents/{document_id}/embeddings",
+    response_model=EmbeddingListResponse,
+    tags=["Documents"],
+)
+def get_document_embeddings(
+    document_id: int,
+    db: DbSession
+) -> EmbeddingListResponse:
+
+    document = db.get(Document, document_id)
+
+    if document is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found."
+        )
+
+    rows = db.scalars(
+        select(DocumentChunk)
+        .where(DocumentChunk.document_id == document_id)
+        .order_by(DocumentChunk.chunk_index)
+    ).all()
+
+    return EmbeddingListResponse(
+        document_id=document_id,
+        embedding_model=MODEL_NAME,
+        embedding_dimension=EMBEDDING_DIM,
+        embeddings=[
+            EmbeddingItem(
+                chunk_id=row.id,
+                embedding_dimension=len(row.embedding)
+            )
+            for row in rows
+            if row.embedding is not None
+        ],
+    )    
 
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
@@ -304,3 +373,5 @@ def chat(request: ChatRequest, db: DbSession) -> ChatResponse:
         raise database_error("Could not save the chat message. Please try again.") from exc
 
     return ChatResponse(answer=DUMMY_ANSWER)
+
+
