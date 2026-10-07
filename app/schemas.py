@@ -3,13 +3,6 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class UploadResponse(BaseModel):
-    id: int
-    file_name: str
-    file_type: str
-    file_size: int
-    total_chunks: int
-    status: str
 
 
 class DocumentItem(BaseModel):
@@ -72,4 +65,81 @@ class EmbeddingListResponse(BaseModel):
     document_id: int
     embedding_model: str
     embedding_dimension: int
-    embeddings: list[EmbeddingItem]    
+    embeddings: list[EmbeddingItem]
+
+class UploadResult(BaseModel):
+    """Outcome for ONE file in an upload batch."""
+    file_name: str
+    success: bool
+    id: int | None = None
+    file_type: str | None = None
+    file_size: int | None = None
+    total_chunks: int = 0
+    status: str
+    error: str | None = None
+
+
+class BatchUploadResponse(BaseModel):
+    total_files: int
+    uploaded: int
+    failed: int
+    results: list[UploadResult]
+
+
+class BatchProcessRequest(BaseModel):
+    document_ids: list[int] | None = Field(
+        default=None,
+        description="Documents to (re)process. Leave empty to process ALL documents.",
+        examples=[[1, 2, 3]],
+    )
+
+
+class ProcessResult(BaseModel):
+    document_id: int
+    file_name: str | None = None
+    success: bool
+    total_chunks: int = 0
+    error: str | None = None
+
+
+class BatchProcessResponse(BaseModel):
+    total_documents: int
+    processed: int
+    failed: int
+    results: list[ProcessResult]
+
+
+class SearchRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=1000,
+        examples=["How is rent calculated?"],
+    )
+
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Number of chunks to return.",
+    )
+
+
+class SearchResultItem(BaseModel):
+    chunk_id: int
+    document_id: int
+    file_name: str
+    chunk_number: int
+    text: str
+    score: float
+
+
+class SearchResponse(BaseModel):
+    query: str
+    results: list[SearchResultItem]
+
+
+class RebuildResponse(BaseModel):
+    indexed_chunks: int        

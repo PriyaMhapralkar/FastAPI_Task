@@ -5,8 +5,9 @@ from pathlib import Path
 from typing import Annotated
 from sqlalchemy import delete, select
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
-
+from fastapi import Depends, FastAPI, File, Form, HTTPException,Response, UploadFile, status
+from fastapi.openapi.utils import get_openapi
+from app import vector_store
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -27,16 +28,25 @@ from app.embeddings import (
 
 from app.database import get_db
 from app.schemas import (
+    BatchProcessRequest,
+    BatchProcessResponse,
+    BatchUploadResponse,
     ChatRequest,
     ChatResponse,
     ChunkItem,
     DocumentItem,
     DocumentListResponse,
-    ProcessResponse,
-    UploadResponse,
     EmbeddingItem,
     EmbeddingListResponse,
+    ProcessResponse,
+    ProcessResult,
+    RebuildResponse,
+    SearchRequest,
+    SearchResponse,
+    SearchResultItem,
+    UploadResult,
 )
+MAX_FILES_PER_UPLOAD = 10
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +55,35 @@ app = FastAPI(
     description="Upload documents, list them, and chat. Data is stored in PostgreSQL.",
     version="2.0.0",
 )
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        openapi_version=app.openapi_version,
+        routes=app.routes,
+    )
+
+    # Tell Swagger that every item of "files" is a binary file
+    for body in schema.get("components", {}).get("schemas", {}).values():
+        files = body.get("properties", {}).get("files")
+
+        if files and files.get("type") == "array":
+            files["items"] = {
+                "type": "string",
+                "format": "binary"
+            }
+
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -103,12 +142,9 @@ def save_file(extension: str, contents: bytes) -> Path:
         raise database_error("Could not save the uploaded file. Please try again.") from exc
     return saved_path
 
-
-def process_document(
-    db: Session,
-    document: Document
-) -> list[DocumentChunk]:
-    """Extract, clean, chunk, and save a document's text."""
+def process_document(db: Session, document: Document) -> list[DocumentChunk]:
+    """Read the file, extract + clean the text, chunk it, embed it, store it
+    in PostgreSQL and update the FAISS index."""
 
     path = BASE_DIR / document.file_path
 
@@ -117,24 +153,31 @@ def process_document(
             "The file is missing from the uploads folder."
         )
 
-    extension = f".{document.file_type}"
-
     text = clean_text(
-        extract_text(path, extension)
+        extract_text(
+            path,
+            f".{document.file_type}"
+        )
     )
 
     pieces = chunk_text(text)
 
     if not pieces:
         raise ProcessingError(
-            "No readable text found. "
-            "The file may be empty or a scanned image."
+            "No readable text found. The file may be empty or a scanned image."
         )
 
-    try:
-        embeddings = embed_texts(pieces)
-    except EmbeddingError:
-        raise
+    # Embed BEFORE touching the database:
+    # if the model fails, old chunks stay intact.
+    vectors = embed_texts(pieces)
+
+    old_ids = list(
+        db.scalars(
+            select(DocumentChunk.id).where(
+                DocumentChunk.document_id == document.id
+            )
+        )
+    )
 
     db.execute(
         delete(DocumentChunk).where(
@@ -143,50 +186,52 @@ def process_document(
     )
 
     rows = [
-    DocumentChunk(
-        document_id=document.id,
-        chunk_index=i,
-        chunk_text=piece,
-        char_count=len(piece),
-        embedding=embedding,
-    )
-    for i, (piece, embedding) in enumerate(
-        zip(pieces, embeddings),
-        start=1,
-    )
-]
+        DocumentChunk(
+            document_id=document.id,
+            chunk_index=i,
+            chunk_text=piece,
+            char_count=len(piece),
+            embedding=vector,
+        )
+        for i, (piece, vector) in enumerate(
+            zip(pieces, vectors),
+            start=1
+        )
+    ]
+
     db.add_all(rows)
     db.commit()
+
+    vector_store.update_document(
+        db,
+        old_ids,
+        [row.id for row in rows],
+        vectors
+    )
 
     return rows
 
 
-@app.get("/", tags=["Health"])
-def root() -> dict[str, str]:
-    return {"message": "Document & Chat API is running"}
+def store_upload(
+    db: Session,
+    file: UploadFile,
+    uploaded_by: str | None
+) -> UploadResult:
 
-
-@app.post(
-    "/upload",
-    response_model=UploadResponse,
-    status_code=status.HTTP_201_CREATED,
-    tags=["Documents"],
-)
-def upload_document(
-    db: DbSession,
-    file: UploadFile | None = File(default=None),
-    uploaded_by: str | None = Form(
-        default=None, description="Optional name or ID of the user uploading the file."
-    ),
-) -> UploadResponse:
-    uploaded_by = (uploaded_by or "").strip() or None  
     original_name, extension = get_validated_name_and_extension(file)
+
     contents = file.file.read()
+
     if not contents:
         raise bad_request("The uploaded file is empty.")
 
     content_hash = compute_hash(contents)
-    if db.scalar(select(Document.id).where(Document.content_hash == content_hash)):
+
+    if db.scalar(
+        select(Document.id).where(
+            Document.content_hash == content_hash
+        )
+    ):
         raise duplicate_error()
 
     saved_path = save_file(extension, contents)
@@ -199,45 +244,144 @@ def upload_document(
         uploaded_by=uploaded_by,
         content_hash=content_hash,
     )
+
     db.add(document)
+
     try:
         db.commit()
+
     except IntegrityError:
         db.rollback()
         saved_path.unlink(missing_ok=True)
         raise duplicate_error()
+
     except SQLAlchemyError as exc:
         db.rollback()
-        saved_path.unlink(missing_ok=True)  
-        logger.exception("Database error while saving document")
-        raise database_error("Could not store the document information. Please try again.") from exc
+        saved_path.unlink(missing_ok=True)
 
-    db.refresh(document) 
+        logger.exception(
+            "Database error while saving document"
+        )
+
+        raise database_error(
+            "Could not store the document information."
+        ) from exc
+
+    db.refresh(document)
+
+    document_id = document.id
 
     try:
         total_chunks = len(
             process_document(db, document)
         )
-    except (ProcessingError, EmbeddingError, SQLAlchemyError) as exc:
+
+    except (
+        ProcessingError,
+        EmbeddingError,
+        SQLAlchemyError
+    ) as exc:
+
         db.rollback()
 
         logger.warning(
-            "Document %s uploaded but not chunked: %s",
-            document.id,
-            exc,
+            "Document %s uploaded but not processed: %s",
+            document_id,
+            exc
         )
 
         total_chunks = 0
 
-    return UploadResponse(
-    id=document.id,
-    file_name=document.file_name,
-    file_type=document.file_type,
-    file_size=document.file_size,
-    total_chunks=total_chunks,
-    status="Uploaded successfully",
-)
+    return UploadResult(
+        file_name=original_name,
+        success=True,
+        id=document_id,
+        file_type=extension.lstrip("."),
+        file_size=len(contents),
+        total_chunks=total_chunks,
+        status=(
+            "Uploaded successfully"
+            if total_chunks
+            else "Uploaded, but the text could not be processed"
+        ),
+    )
 
+
+@app.get("/", tags=["Health"])
+def root() -> dict[str, str]:
+    return {"message": "Document & Chat API is running"}
+
+
+@app.post(
+    "/upload",
+    response_model=BatchUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Documents"],
+)
+def upload_documents(
+    response: Response,
+    db: DbSession,
+    files: list[UploadFile] = File(
+        ...,
+        description="One or more documents."
+    ),
+    uploaded_by: str | None = Form(
+        default=None,
+        max_length=100,
+        description="Optional name or ID of the uploader.",
+    ),
+) -> BatchUploadResponse:
+
+    if len(files) > MAX_FILES_PER_UPLOAD:
+        raise bad_request(
+            f"Too many files. Upload at most "
+            f"{MAX_FILES_PER_UPLOAD} at a time."
+        )
+
+    uploaded_by = (uploaded_by or "").strip() or None
+
+    results: list[UploadResult] = []
+
+    for file in files:
+        try:
+            results.append(
+                store_upload(
+                    db,
+                    file,
+                    uploaded_by
+                )
+            )
+
+        except HTTPException as exc:
+            db.rollback()
+
+            results.append(
+                UploadResult(
+                    file_name=Path(
+                        file.filename or ""
+                    ).name or "(no name)",
+                    success=False,
+                    status="Failed",
+                    error=str(exc.detail),
+                )
+            )
+
+    uploaded = sum(
+        result.success
+        for result in results
+    )
+
+    if uploaded == 0:
+        response.status_code = (
+            status.HTTP_400_BAD_REQUEST
+        )
+
+    return BatchUploadResponse(
+        total_files=len(results),
+        uploaded=uploaded,
+        failed=len(results) - uploaded,
+        results=results,
+    )
 
 @app.get("/documents", response_model=DocumentListResponse, tags=["Documents"])
 def list_documents(db: DbSession) -> DocumentListResponse:
@@ -316,6 +460,108 @@ def process_document_endpoint(
             for row in rows
         ],
     )
+
+@app.post(
+    "/documents/process",
+    response_model=BatchProcessResponse,
+    tags=["Documents"],
+)
+def process_documents(
+    request: BatchProcessRequest,
+    db: DbSession
+) -> BatchProcessResponse:
+
+    query = select(Document).order_by(Document.id)
+
+    if request.document_ids:
+        query = query.where(
+            Document.id.in_(request.document_ids)
+        )
+
+    documents = db.scalars(query).all()
+
+    results: list[ProcessResult] = []
+
+    for document in documents:
+
+        try:
+            rows = process_document(
+                db,
+                document
+            )
+
+            results.append(
+                ProcessResult(
+                    document_id=document.id,
+                    file_name=document.file_name,
+                    success=True,
+                    total_chunks=len(rows),
+                )
+            )
+
+        except (
+            ProcessingError,
+            EmbeddingError
+        ) as exc:
+
+            results.append(
+                ProcessResult(
+                    document_id=document.id,
+                    file_name=document.file_name,
+                    success=False,
+                    error=str(exc),
+                )
+            )
+
+        except SQLAlchemyError:
+
+            db.rollback()
+
+            logger.exception(
+                "Database error while processing document %s",
+                document.id
+            )
+
+            results.append(
+                ProcessResult(
+                    document_id=document.id,
+                    file_name=document.file_name,
+                    success=False,
+                    error="Database error.",
+                )
+            )
+
+    found = {
+        document.id
+        for document in documents
+    }
+
+    for missing_id in request.document_ids or []:
+
+        if missing_id not in found:
+
+            results.append(
+                ProcessResult(
+                    document_id=missing_id,
+                    success=False,
+                    error="Document not found.",
+                )
+            )
+
+    processed = sum(
+        result.success
+        for result in results
+    )
+
+    return BatchProcessResponse(
+        total_documents=len(results),
+        processed=processed,
+        failed=len(results) - processed,
+        results=results,
+    )
+
+
+    
 
 
 @app.get(
