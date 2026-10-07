@@ -105,10 +105,15 @@ def chunk_text(text: str) -> list[str]:
 
     for piece in _splitter.split_text(text):
 
-        # Convert whitespace inside each chunk to single spaces
         flat = re.sub(r"\s+", " ", piece).strip()
 
-        if flat:
-            chunks.append(flat)
+        if not flat:
+            continue
+
+        for start in range(0, len(flat), CHUNK_SIZE):
+            chunk = flat[start:start + CHUNK_SIZE].strip()
+
+            if chunk:
+                chunks.append(chunk)
 
     return chunks

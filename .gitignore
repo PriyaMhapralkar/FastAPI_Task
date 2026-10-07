@@ -14,3 +14,8 @@ __pycache__/
 # Uploaded files (keep the folder, ignore the content)
 uploads/*
 !uploads/.gitkeep
+
+
+# FAISS index (rebuildable from PostgreSQL)
+faiss_index/
+faiss_index/chunks.index
