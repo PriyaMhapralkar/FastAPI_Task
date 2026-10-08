@@ -20,8 +20,6 @@ from app.models import DocumentChunk
 logger = logging.getLogger(__name__)
 
 
-# Kept OUTSIDE app/ so saving the index never triggers
-# uvicorn --reload-dir app
 INDEX_DIR = Path(__file__).resolve().parent.parent / "faiss_index"
 INDEX_PATH = INDEX_DIR / "chunks.index"
 

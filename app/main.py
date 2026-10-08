@@ -69,7 +69,6 @@ def custom_openapi():
         routes=app.routes,
     )
 
-    # Tell Swagger that every item of "files" is a binary file
     for body in schema.get("components", {}).get("schemas", {}).values():
         files = body.get("properties", {}).get("files")
 
