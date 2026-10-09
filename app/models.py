@@ -2,10 +2,9 @@ from datetime import datetime
 
 from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
+from pgvector.sqlalchemy import Vector
 from sqlalchemy.dialects.postgresql import JSONB
-
 from app.database import Base
-
 
 
 
@@ -87,7 +86,42 @@ class DocumentChunk(Base):
 
     char_count: Mapped[int] = mapped_column(Integer)
 
-    embedding: Mapped[list[float] | None] = mapped_column(JSONB)
+    embedding: Mapped[list[float] | None] = mapped_column(
+    Vector(768)
+    )
+
+
+    embedding_model: Mapped[str | None] = mapped_column(
+    String(100)
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
+
+class SearchHistory(Base):
+    __tablename__ = "search_history"
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True
+    )
+
+    query: Mapped[str] = mapped_column(
+        Text
+    )
+
+    top_k: Mapped[int] = mapped_column(
+        Integer
+    )
+
+    result_chunk_ids: Mapped[list] = mapped_column(
+        JSONB
+    )
+
+    results_count: Mapped[int] = mapped_column(
+        Integer
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

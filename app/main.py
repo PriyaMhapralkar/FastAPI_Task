@@ -7,12 +7,11 @@ from sqlalchemy import delete, select
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException,Response, UploadFile, status
 from fastapi.openapi.utils import get_openapi
-from app import vector_store
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 
-from app.models import ChatHistory, DocumentChunk, Document
+from app.models import ChatHistory, DocumentChunk, Document, SearchHistory
 from app.processing import (
     ProcessingError,
     chunk_text,
@@ -23,7 +22,8 @@ from app.embeddings import (
     EMBEDDING_DIM,
     MODEL_NAME,
     EmbeddingError,
-    embed_texts,
+    embed_documents,
+    embed_query,
 )
 
 from app.database import get_db
@@ -40,7 +40,6 @@ from app.schemas import (
     EmbeddingListResponse,
     ProcessResponse,
     ProcessResult,
-    RebuildResponse,
     SearchRequest,
     SearchResponse,
     SearchResultItem,
@@ -142,8 +141,8 @@ def save_file(extension: str, contents: bytes) -> Path:
     return saved_path
 
 def process_document(db: Session, document: Document) -> list[DocumentChunk]:
-    """Read the file, extract + clean the text, chunk it, embed it, store it
-    in PostgreSQL and update the FAISS index."""
+    """Read the file, extract + clean the text, chunk it, embed it,
+    and store the chunks and embeddings in PostgreSQL."""
 
     path = BASE_DIR / document.file_path
 
@@ -166,16 +165,7 @@ def process_document(db: Session, document: Document) -> list[DocumentChunk]:
             "No readable text found. The file may be empty or a scanned image."
         )
 
-    vectors = embed_texts(pieces)
-
-    old_ids = list(
-        db.scalars(
-            select(DocumentChunk.id).where(
-                DocumentChunk.document_id == document.id
-            )
-        )
-    )
-
+    vectors = embed_documents(pieces)
     db.execute(
         delete(DocumentChunk).where(
             DocumentChunk.document_id == document.id
@@ -189,6 +179,7 @@ def process_document(db: Session, document: Document) -> list[DocumentChunk]:
             chunk_text=piece,
             char_count=len(piece),
             embedding=vector,
+            embedding_model=MODEL_NAME,
         )
         for i, (piece, vector) in enumerate(
             zip(pieces, vectors),
@@ -199,12 +190,6 @@ def process_document(db: Session, document: Document) -> list[DocumentChunk]:
     db.add_all(rows)
     db.commit()
 
-    vector_store.update_document(
-        db,
-        old_ids,
-        [row.id for row in rows],
-        vectors
-    )
 
     return rows
 
@@ -558,119 +543,83 @@ def process_documents(
     )
 
 
-@app.post(
-    "/search/rebuild",
-    response_model=RebuildResponse,
-    tags=["Search"],
-)
-def rebuild_search_index(db: DbSession) -> RebuildResponse:
-    try:
-        indexed_chunks = vector_store.rebuild(db)
 
-        return RebuildResponse(
-            indexed_chunks=indexed_chunks
-        )
-
-    except (SQLAlchemyError, RuntimeError) as exc:
-        db.rollback()
-
-        logger.exception(
-            "Index rebuild failed"
-        )
-
-        raise database_error(
-            "Could not rebuild the search index."
-        ) from exc  
-
-
-@app.post(
-    "/search",
-    response_model=SearchResponse,
-    tags=["Search"],
-)
-def search_chunks(
+@app.post("/search", response_model=SearchResponse)
+def search_documents(
     request: SearchRequest,
-    db: DbSession
-) -> SearchResponse:
+    db: DbSession,
+):
+    """Search document chunks using PostgreSQL pgvector."""
 
     try:
-        query_vector = embed_texts(
-            [request.query]
-        )[0]
+        query_vector = embed_query(request.query)
 
-    except EmbeddingError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="The embedding model is unavailable. Please try again.",
-        ) from exc
+        distance = DocumentChunk.embedding.cosine_distance(
+            query_vector
+        ).label("distance")
 
-    try:
-        hits = vector_store.search(
-            db,
-            query_vector,
-            request.top_k
-        )
-
-        if not hits:
-            return SearchResponse(
-                query=request.query,
-                results=[]
-            )
-
-        rows = db.execute(
+        statement = (
             select(
                 DocumentChunk.id,
                 DocumentChunk.document_id,
                 DocumentChunk.chunk_index,
                 DocumentChunk.chunk_text,
                 Document.file_name,
+                distance,
             )
             .join(
                 Document,
-                Document.id == DocumentChunk.document_id
+                Document.id == DocumentChunk.document_id,
             )
-            .where(
-                DocumentChunk.id.in_(
-                    [chunk_id for chunk_id, _ in hits]
-                )
-            )
-        ).all()
-
-    except (SQLAlchemyError, RuntimeError) as exc:
-        db.rollback()
-
-        logger.exception(
-            "Search failed"
+            .where(DocumentChunk.embedding.is_not(None))
+            .order_by(distance)
+            .limit(request.top_k)
         )
 
-        raise database_error(
-            "Search failed. Please try again."
+        rows = db.execute(statement).all()
+
+        results = [
+            SearchResultItem(
+                chunk_id=row.id,
+                document_id=row.document_id,
+                file_name=row.file_name,
+                chunk_number=row.chunk_index,
+                text=row.chunk_text,
+                score=1.0 - float(row.distance),
+            )
+            for row in rows
+        ]
+
+        history = SearchHistory(
+            query=request.query,
+            top_k=request.top_k,
+            result_chunk_ids=[
+                result.chunk_id
+        for result in results
+    ],
+    results_count=len(results),
+)
+        db.add(history)
+        db.commit()
+
+        return SearchResponse(
+            query=request.query,
+            results=results,
+        )
+
+    except EmbeddingError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
         ) from exc
 
-    by_id = {
-        row.id: row
-        for row in rows
-    }
-
-    results = [
-        SearchResultItem(
-            chunk_id=chunk_id,
-            document_id=by_id[chunk_id].document_id,
-            file_name=by_id[chunk_id].file_name,
-            chunk_number=by_id[chunk_id].chunk_index,
-            text=by_id[chunk_id].chunk_text,
-            score=round(score, 4),
-        )
-        for chunk_id, score in hits
-        if chunk_id in by_id
-    ]
-
-    return SearchResponse(
-        query=request.query,
-        results=results
-    )          
-
-
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Database search failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Database search failed.",
+        ) from exc
     
 
 

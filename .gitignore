@@ -16,6 +16,3 @@ uploads/*
 !uploads/.gitkeep
 
 
-# FAISS index (rebuildable from PostgreSQL)
-faiss_index/
-faiss_index/chunks.index

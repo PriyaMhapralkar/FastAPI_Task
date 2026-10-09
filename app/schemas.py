@@ -141,5 +141,3 @@ class SearchResponse(BaseModel):
     results: list[SearchResultItem]
 
 
-class RebuildResponse(BaseModel):
-    indexed_chunks: int        

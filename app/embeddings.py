@@ -1,11 +1,16 @@
+import logging
+import os
 import threading
 
 from sentence_transformers import SentenceTransformer
 
 
-MODEL_NAME = "BAAI/bge-m3"
-EMBEDDING_DIM = 1024
-BATCH_SIZE = 8
+MODEL_NAME = "nomic-ai/nomic-embed-text-v1.5"
+EMBEDDING_DIM = 768
+BATCH_SIZE = 4
+
+DOC_PREFIX = "search_document: "
+QUERY_PREFIX = "search_query: "
 
 _model = None
 _model_lock = threading.Lock()
@@ -16,19 +21,30 @@ class EmbeddingError(Exception):
 
 
 def get_model() -> SentenceTransformer:
-    """Load BGE-M3 once and reuse it."""
+    """Load the Nomic model once and reuse it."""
 
     global _model
 
     if _model is None:
         with _model_lock:
             if _model is None:
-                _model = SentenceTransformer(MODEL_NAME)
+
+                model = SentenceTransformer(
+                    MODEL_NAME
+                    
+                )
+
+                model.max_seq_length = 512
+
+                _model = model
 
     return _model
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Generate normalized BGE-M3 embeddings for a list of texts."""
+
+def _embed(
+    texts: list[str],
+    prefix: str
+) -> list[list[float]]:
 
     if not texts:
         return []
@@ -37,7 +53,7 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
         model = get_model()
 
         embeddings = model.encode(
-            texts,
+            [prefix + text for text in texts],
             batch_size=BATCH_SIZE,
             normalize_embeddings=True,
             show_progress_bar=False,
@@ -50,5 +66,21 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 
     except Exception as exc:
         raise EmbeddingError(
-            "Could not generate document embeddings."
+            "Could not generate embeddings."
         ) from exc
+
+
+def embed_documents(
+    texts: list[str]
+) -> list[list[float]]:
+
+    """Generate embeddings for document chunks."""
+
+    return _embed(texts, DOC_PREFIX)
+
+
+def embed_query(text: str) -> list[float]:
+
+    """Generate an embedding for a search query."""
+
+    return _embed([text], QUERY_PREFIX)[0]
