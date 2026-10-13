@@ -3,7 +3,7 @@ import logging
 import uuid
 from pathlib import Path
 from typing import Annotated
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, func
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException,Response, UploadFile, status
 from fastapi.openapi.utils import get_openapi
@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 
-from app.models import ChatHistory, DocumentChunk, Document, SearchHistory
+from app.models import ChatHistory, DocumentChunk, Document, SearchHistory, QueryChunk
 from app.processing import (
     ProcessingError,
     chunk_text,
@@ -24,6 +24,7 @@ from app.embeddings import (
     EmbeddingError,
     embed_documents,
     embed_query,
+    embed_queries,
 )
 
 from app.database import get_db
@@ -44,7 +45,11 @@ from app.schemas import (
     SearchResponse,
     SearchResultItem,
     UploadResult,
+    QueryChunkItem,
 )
+
+from app.llm import LLMError, NOT_FOUND, generate_answer
+
 MAX_FILES_PER_UPLOAD = 10
 
 logger = logging.getLogger(__name__)
@@ -287,6 +292,58 @@ def store_upload(
             else "Uploaded, but the text could not be processed"
         ),
     )
+
+
+def retrieve_chunks(
+    db: Session,
+    query: str,
+    top_k: int = 3,
+) -> list[SearchResultItem]:
+    """Retrieve the most relevant document chunks from pgvector."""
+
+    query_chunks = chunk_text(clean_text(query))
+
+    if not query_chunks:
+        return []
+
+    query_vectors = embed_queries(query_chunks)
+
+    distance = func.least(
+        *[
+            DocumentChunk.embedding.cosine_distance(vector)
+            for vector in query_vectors
+        ]
+    ).label("distance")
+
+    statement = (
+        select(
+            DocumentChunk.id,
+            DocumentChunk.document_id,
+            DocumentChunk.chunk_index,
+            DocumentChunk.chunk_text,
+            Document.file_name,
+            distance,
+        )
+        .join(Document, Document.id == DocumentChunk.document_id)
+        .where(DocumentChunk.embedding.is_not(None))
+        .order_by(distance)
+        .limit(top_k)
+    )
+
+    rows = db.execute(statement).all()
+
+    return [
+        SearchResultItem(
+            chunk_id=row.id,
+            document_id=row.document_id,
+            file_name=row.file_name,
+            chunk_number=row.chunk_index,
+            text=row.chunk_text,
+            score=1.0 - float(row.distance),
+        )
+        for row in rows
+    ]
+
 
 
 @app.get("/", tags=["Health"])
@@ -548,14 +605,48 @@ def process_documents(
 def search_documents(
     request: SearchRequest,
     db: DbSession,
-):
-    """Search document chunks using PostgreSQL pgvector."""
+) -> SearchResponse:
+    """Split the query, save query chunks and embeddings, and search pgvector."""
 
     try:
-        query_vector = embed_query(request.query)
+        query_chunks = chunk_text(clean_text(request.query))
 
-        distance = DocumentChunk.embedding.cosine_distance(
-            query_vector
+        if not query_chunks:
+            raise bad_request("The search query is empty.")
+
+        query_vectors = embed_queries(query_chunks)
+
+        history = SearchHistory(
+            query=request.query,
+            top_k=request.top_k,
+            result_chunk_ids=[],
+            results_count=0,
+        )
+        db.add(history)
+        db.flush()
+
+        query_chunk_rows = [
+            QueryChunk(
+                search_id=history.id,
+                chunk_index=index,
+                chunk_text=chunk,
+                char_count=len(chunk),
+                embedding=vector,
+                embedding_model=MODEL_NAME,
+            )
+            for index, (chunk, vector) in enumerate(
+                zip(query_chunks, query_vectors),
+                start=1,
+            )
+        ]
+
+        db.add_all(query_chunk_rows)
+
+        distance = func.least(
+            *[
+                DocumentChunk.embedding.cosine_distance(vector)
+                for vector in query_vectors
+            ]
         ).label("distance")
 
         statement = (
@@ -590,26 +681,31 @@ def search_documents(
             for row in rows
         ]
 
-        history = SearchHistory(
-            query=request.query,
-            top_k=request.top_k,
-            result_chunk_ids=[
-                result.chunk_id
-        for result in results
-    ],
-    results_count=len(results),
-)
-        db.add(history)
+        history.result_chunk_ids = [
+            result.chunk_id for result in results
+        ]
+        history.results_count = len(results)
+
         db.commit()
 
         return SearchResponse(
             query=request.query,
+            search_id=history.id,
+            total_query_chunks=len(query_chunk_rows),
+            query_chunks=[
+                QueryChunkItem(
+                    chunk_number=row.chunk_index,
+                    text=row.chunk_text,
+                )
+                for row in query_chunk_rows
+            ],
             results=results,
         )
 
     except EmbeddingError as exc:
+        db.rollback()
         raise HTTPException(
-            status_code=500,
+            status_code=503,
             detail=str(exc),
         ) from exc
 
@@ -659,24 +755,88 @@ def get_document_embeddings(
             for row in rows
             if row.embedding is not None
         ],
-    )    
+    )  
+
+
+
+    
+      
+
 
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
-def chat(request: ChatRequest, db: DbSession) -> ChatResponse:
-    entry = ChatHistory(
-        user_id=request.user_id,
-        message=request.message,
-        response=DUMMY_ANSWER,
-    )
-    db.add(entry)
+def chat(
+    request: ChatRequest,
+    db: DbSession,
+) -> ChatResponse:
+    """Answer questions using retrieved document chunks and local Qwen."""
+
     try:
+        retrieved_chunks = retrieve_chunks(
+            db=db,
+            query=request.message,
+            top_k=3,
+        )
+
+        if not retrieved_chunks:
+            answer = "No relevant processed documents were found."
+            sources = []
+        else:
+            passages = [
+                (chunk.file_name, chunk.text)
+                for chunk in retrieved_chunks
+            ]
+
+            answer = generate_answer(
+                question=request.message,
+                passages=passages,
+            )
+
+            if answer.strip() == NOT_FOUND:
+                sources = []
+            else:
+                sources = [
+                    {
+                        "document_id": chunk.document_id,
+                        "file_name": chunk.file_name,
+                        "chunk_id": chunk.chunk_id,
+                        "score": chunk.score,
+                    }
+                    for chunk in retrieved_chunks
+                ]
+
+        entry = ChatHistory(
+            user_id=request.user_id,
+            message=request.message,
+            response=answer,
+        )
+        db.add(entry)
         db.commit()
+
+        return ChatResponse(
+            answer=answer,
+            sources=sources,
+        )
+
+    except EmbeddingError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+        ) from exc
+
+    except LLMError as exc:
+        db.rollback()
+        logger.exception("Ollama answer generation failed")
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+        ) from exc
+
     except SQLAlchemyError as exc:
         db.rollback()
-        logger.exception("Database error while saving chat history")
-        raise database_error("Could not save the chat message. Please try again.") from exc
-
-    return ChatResponse(answer=DUMMY_ANSWER)
-
-
+        logger.exception("Database error while processing chat")
+        raise HTTPException(
+            status_code=500,
+            detail="Database error while processing chat.",
+        ) from exc

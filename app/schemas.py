@@ -39,8 +39,17 @@ class ChatRequest(BaseModel):
     )
 
 
+
+class ChatSource(BaseModel):
+    document_id: int
+    file_name: str
+    chunk_id: int
+    score: float
+
+
 class ChatResponse(BaseModel):
     answer: str
+    sources: list[ChatSource] = Field(default_factory=list)
 
 
 class ChunkItem(BaseModel):
@@ -136,8 +145,17 @@ class SearchResultItem(BaseModel):
     score: float
 
 
+
+
+
+class QueryChunkItem(BaseModel):
+    chunk_number: int
+    text: str
+
+
 class SearchResponse(BaseModel):
     query: str
+    search_id: int | None = None
+    total_query_chunks: int
+    query_chunks: list[QueryChunkItem]
     results: list[SearchResultItem]
-
-

@@ -79,8 +79,12 @@ def embed_documents(
     return _embed(texts, DOC_PREFIX)
 
 
+
+def embed_queries(texts: list[str]) -> list[list[float]]:
+    """Embed several search-query chunks in one batch (used on every /search call)."""
+    return _embed(texts, QUERY_PREFIX)
+
+
 def embed_query(text: str) -> list[float]:
-
-    """Generate an embedding for a search query."""
-
-    return _embed([text], QUERY_PREFIX)[0]
+    """Embed one search question."""
+    return embed_queries([text])[0]

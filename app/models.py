@@ -127,3 +127,33 @@ class SearchHistory(Base):
         DateTime(timezone=True),
         server_default=func.now()
     )
+
+
+
+
+class QueryChunk(Base):
+    __tablename__ = "query_chunks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    search_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("search_history.id", ondelete="CASCADE")
+    )
+
+    chunk_index: Mapped[int] = mapped_column(Integer)
+    chunk_text: Mapped[str] = mapped_column(Text)
+    char_count: Mapped[int] = mapped_column(Integer)
+
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(768)
+    )
+
+    embedding_model: Mapped[str | None] = mapped_column(
+        String(100)
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
