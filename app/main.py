@@ -49,6 +49,8 @@ from app.schemas import (
 )
 
 from app.llm import LLMError, NOT_FOUND, generate_answer
+from app.routing import route_question
+from app.sql_agent import answer_sql_question
 
 MAX_FILES_PER_UPLOAD = 10
 
@@ -764,58 +766,119 @@ def get_document_embeddings(
 
 
 
+
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 def chat(
     request: ChatRequest,
     db: DbSession,
 ) -> ChatResponse:
-    """Answer questions using retrieved document chunks and local Qwen."""
+    """Answer questions using documents, database, or both."""
 
     try:
-        retrieved_chunks = retrieve_chunks(
-            db=db,
-            query=request.message,
-            top_k=3,
-        )
+        route = route_question(request.message)
 
-        if not retrieved_chunks:
-            answer = "No relevant processed documents were found."
-            sources = []
-        else:
-            passages = [
-                (chunk.file_name, chunk.text)
-                for chunk in retrieved_chunks
-            ]
+        sources = []
+        sql_query = None
 
-            answer = generate_answer(
-                question=request.message,
-                passages=passages,
+        # Route 1: Answer using the training database.
+        if route == "database":
+            answer, sql_query = answer_sql_question(request.message)
+
+        # Route 2: Answer using uploaded documents.
+        elif route == "documents":
+            retrieved_chunks = retrieve_chunks(
+                db=db,
+                query=request.message,
+                top_k=3,
             )
 
-            if answer.strip() == NOT_FOUND:
-                sources = []
+            if not retrieved_chunks:
+                answer = "No relevant processed documents were found."
             else:
-                sources = [
-                    {
-                        "document_id": chunk.document_id,
-                        "file_name": chunk.file_name,
-                        "chunk_id": chunk.chunk_id,
-                        "score": chunk.score,
-                    }
+                passages = [
+                    (chunk.file_name, chunk.text)
                     for chunk in retrieved_chunks
                 ]
+
+                answer = generate_answer(
+                    question=request.message,
+                    passages=passages,
+                )
+
+                if answer.strip() != NOT_FOUND:
+                    sources = [
+                        {
+                            "document_id": chunk.document_id,
+                            "file_name": chunk.file_name,
+                            "chunk_id": chunk.chunk_id,
+                            "score": chunk.score,
+                        }
+                        for chunk in retrieved_chunks
+                    ]
+
+        # Route 3: Answer using both documents and the database.
+        else:
+            retrieved_chunks = retrieve_chunks(
+                db=db,
+                query=request.message,
+                top_k=3,
+            )
+
+            if not retrieved_chunks:
+                document_answer = (
+                    "No relevant processed documents were found."
+                )
+            else:
+                passages = [
+                    (chunk.file_name, chunk.text)
+                    for chunk in retrieved_chunks
+                ]
+
+                document_answer = generate_answer(
+                    question=request.message,
+                    passages=passages,
+                )
+
+                if document_answer.strip() == NOT_FOUND:
+                    document_answer = (
+                        "No relevant answer was found in the documents."
+                    )
+                else:
+                    sources = [
+                        {
+                            "document_id": chunk.document_id,
+                            "file_name": chunk.file_name,
+                            "chunk_id": chunk.chunk_id,
+                            "score": chunk.score,
+                        }
+                        for chunk in retrieved_chunks
+                    ]
+
+            database_answer, sql_query = answer_sql_question(
+                request.message
+            )
+
+            answer = (
+                f"Document answer:\n{document_answer}\n\n"
+                f"Database answer:\n{database_answer}"
+            )
 
         entry = ChatHistory(
             user_id=request.user_id,
             message=request.message,
             response=answer,
+            source_used=route,
+            sql_query=sql_query,
         )
+
         db.add(entry)
         db.commit()
 
         return ChatResponse(
             answer=answer,
             sources=sources,
+            source_used=route,
+            sql_query=sql_query,
         )
 
     except EmbeddingError as exc:
@@ -831,6 +894,14 @@ def chat(
         raise HTTPException(
             status_code=503,
             detail=str(exc),
+        ) from exc
+
+    except (RuntimeError, ValueError) as exc:
+        db.rollback()
+        logger.exception("SQL agent or routing error")
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to process the question. Check the SQL agent and Ollama logs.",
         ) from exc
 
     except SQLAlchemyError as exc:

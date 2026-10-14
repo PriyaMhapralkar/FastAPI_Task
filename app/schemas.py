@@ -47,9 +47,13 @@ class ChatSource(BaseModel):
     score: float
 
 
+
 class ChatResponse(BaseModel):
     answer: str
     sources: list[ChatSource] = Field(default_factory=list)
+    source_used: str = "documents"
+    sql_query: str | None = None
+
 
 
 class ChunkItem(BaseModel):

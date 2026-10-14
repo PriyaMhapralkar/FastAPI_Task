@@ -46,6 +46,7 @@ class Document(Base):
     )
 
 
+
 class ChatHistory(Base):
     __tablename__ = "chat_history"
 
@@ -69,6 +70,17 @@ class ChatHistory(Base):
         DateTime(timezone=True),
         server_default=func.now()
     )
+
+    source_used: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True
+    )
+
+    sql_query: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True
+    )
+
 
 class DocumentChunk(Base):
     __tablename__ = "document_chunks"
